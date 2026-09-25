@@ -1,137 +1,154 @@
 """
 Extractor de información de logs de tráfico de red.
 
-Lee un archivo .log con formato estilo Apache/Nginx (formato "combined")
-y extrae: IP, fecha/hora, método HTTP, ruta solicitada, código de estado,
-tamaño de respuesta y user-agent.
+No importa el formato ni la estructura del archivo de log (Apache, Nginx,
+firewall, formato personalizado, texto plano, etc.): el programa busca
+cada patrón directamente en el contenido de cada línea, sin asumir un
+orden de columnas fijo. Si el dato existe en la línea, se encuentra.
 
-Ejemplo de línea de log que este programa espera:
-192.168.1.10 - - [15/Mar/2024:14:32:10 +0000] "GET /index.html HTTP/1.1" 200 5324 "-" "Mozilla/5.0"
+El usuario elige mediante un menú qué quiere buscar. Las opciones
+corresponden a los patrones descritos en el índice: IPv4, Puerto,
+Fecha y hora, Protocolo, MAC, Flags TCP, Bytes/longitud y Dominio/URL.
 """
 import re
-from collections import Counter
 
 # ---------------------------------------------------------------------------
-# 1. EL PATRÓN REGEX
+# 1. LOS PATRONES REGEX (uno por cada elemento del índice)
 # ---------------------------------------------------------------------------
-# Usamos grupos con nombre (?P<nombre>...) para que sea fácil leer el
-# resultado después, en vez de acordarnos de "el grupo 3" o "el grupo 5".
-PATRON_LOG = re.compile(
-    r'(?P<ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+'      # IP del cliente
-    r'\S+\s+\S+\s+'                                        # dos campos que casi siempre son "-"
-    r'\[(?P<fecha>[^\]]+)\]\s+'                             # fecha entre corchetes [15/Mar/2024:...]
-    r'"(?P<metodo>[A-Z]+)\s+'                               # método HTTP: GET, POST, etc.
-    r'(?P<ruta>\S+)\s+'                                     # ruta solicitada: /index.html
-    r'[^"]*"\s+'                                            # el resto de la línea de request (HTTP/1.1)
-    r'(?P<codigo>\d{3})\s+'                                 # código de estado: 200, 404, etc.
-    r'(?P<tamano>\d+|-)\s*'                                 # tamaño de la respuesta en bytes
-    r'"(?P<referer>[^"]*)"\s*'                               # referer (opcional, puede ir vacío)
-    r'"(?P<user_agent>[^"]*)"'                               # user-agent del cliente
-)
+# Nota: cuando un patrón tiene un grupo de captura (paréntesis), re.findall
+# devuelve solo lo que hay dentro del grupo. Cuando no tiene grupos,
+# devuelve la coincidencia completa. Por eso algunos patrones capturan
+# solo la parte "útil" (p. ej. el número de puerto) y otros no.
 
+PATRONES = {
+    "1": (
+        "Dirección IPv4",
+        # 4 grupos de 1 a 3 dígitos separados por punto.
+        # Usamos (?:...) en vez de (...) para que findall devuelva
+        # la IP completa y no solo el último grupo.
+        re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    ),
+    "2": (
+        "Puerto",
+        # El puerto va pegado a una IP después de ":" (IP:puerto).
+        # Esto funciona sin importar qué haya antes o después en la
+        # línea, porque solo buscamos ese fragmento dentro del texto.
+        # Capturamos solo el número de puerto (1 a 5 dígitos).
+        re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}:(\d{1,5})\b"),
+    ),
+    "3": (
+        "Fecha y hora",
+        # Fecha AAAA-MM-DD, un espacio, hora HH:MM:SS
+        re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"),
+    ),
+    "4": (
+        "Protocolo",
+        # No es un patrón numérico, sino una lista de palabras posibles.
+        re.compile(r"\b(?:TCP|UDP|ICMP|HTTP)\b"),
+    ),
+    "5": (
+        "Dirección MAC",
+        # 6 grupos de 2 caracteres hexadecimales, separados por : o -
+        re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b"),
+    ),
+    "6": (
+        "Flags TCP",
+        # Palabras cortas dentro de corchetes, separadas por coma.
+        # Capturamos solo el contenido, sin los corchetes.
+        re.compile(r"\[([A-Z_]+(?:,[A-Z_]+)*)\]"),
+    ),
+    "7": (
+        "Bytes / longitud del paquete",
+        # Etiqueta fija (len=, bytes=, size=) seguida de dígitos.
+        re.compile(r"(?:len|bytes|size)=\d+"),
+    ),
+    "8": (
+        "Dominio / URL",
+        # Empieza con http:// o https:// y sigue con caracteres sin espacio.
+        re.compile(r"https?://\S+"),
+    ),
+}
 
-def leer_log(ruta_archivo):
+def cargar_lineas():
     """
-    Lee el archivo línea por línea y devuelve una lista de diccionarios
-    con la información extraída de cada línea que coincida con el patrón.
-
-    Usamos re.finditer/match línea por línea (no findall sobre todo el
-    archivo de una vez) para poder saber también qué líneas NO coincidieron,
-    lo cual es útil para depurar logs con formato irregular.
+    Pide al usuario la ruta del archivo de log y lo abre. No importa el
+    formato del archivo (Apache, Nginx, firewall, texto plano, etc.):
+    solo se necesita que sea un archivo de texto legible. Si la ruta no
+    existe, vuelve a preguntar.
     """
-    registros = []
-    lineas_no_reconocidas = 0
-
-    with open(ruta_archivo, "r", encoding="utf-8") as f:
-        for numero_linea, linea in enumerate(f, start=1):
-            linea = linea.strip()
-            if not linea:
-                continue
-
-            coincidencia = PATRON_LOG.match(linea)
-
-            if coincidencia:
-                # .groupdict() nos da un diccionario listo:
-                # {'ip': '...', 'fecha': '...', 'metodo': '...', ...}
-                datos = coincidencia.groupdict()
-                datos["linea"] = numero_linea
-                registros.append(datos)
-            else:
-                lineas_no_reconocidas += 1
-                print(f"[Aviso] Línea {numero_linea} no coincide con el patrón esperado")
-
-    print(f"\nTotal de líneas procesadas correctamente: {len(registros)}")
-    print(f"Total de líneas no reconocidas: {lineas_no_reconocidas}\n")
-
-    return registros
+    while True:
+        ruta_archivo = input("Ruta del archivo de log a analizar: ").strip()
+        try:
+            with open(ruta_archivo, "r", encoding="utf-8", errors="ignore") as f:
+                lineas = f.readlines()
+            print(f"Archivo '{ruta_archivo}' cargado correctamente "
+                  f"({len(lineas)} líneas).")
+            return [linea.strip() for linea in lineas if linea.strip()]
+        except FileNotFoundError:
+            print(f"[Error] No se encontró el archivo '{ruta_archivo}'. Intenta de nuevo.\n")
+        except OSError as error:
+            print(f"[Error] No se pudo abrir el archivo: {error}\n")
 
 
-def generar_estadisticas(registros):
+def mostrar_menu():
+    """Imprime las opciones disponibles, tomadas del índice."""
+    print("\n=== ¿Qué deseas buscar en el log? ===")
+    for clave, (nombre, _patron) in PATRONES.items():
+        print(f"  {clave}. {nombre}")
+    print("  0. Salir")
+
+
+def buscar_en_log(lineas, patron, nombre):
     """
-    Genera un resumen simple a partir de los registros extraídos:
-    IPs más frecuentes, códigos de estado más comunes y métodos HTTP usados.
+    Aplica el patrón elegido a cada línea del log y muestra las
+    coincidencias encontradas, junto con el número de línea.
     """
-    ips = Counter(r["ip"] for r in registros)
-    codigos = Counter(r["codigo"] for r in registros)
-    metodos = Counter(r["metodo"] for r in registros)
+    total_coincidencias = 0
 
-    print("=== IPs con más peticiones ===")
-    for ip, cantidad in ips.most_common(5):
-        print(f"  {ip}: {cantidad} peticiones")
+    print(f"\n=== Resultados para: {nombre} ===")
+    for numero_linea, linea in enumerate(lineas, start=1):
+        coincidencias = patron.findall(linea)
+        if coincidencias:
+            total_coincidencias += len(coincidencias)
+            valores = ", ".join(coincidencias)
+            print(f"  Línea {numero_linea}: {valores}")
 
-    print("\n=== Códigos de estado encontrados ===")
-    for codigo, cantidad in codigos.most_common():
-        print(f"  {codigo}: {cantidad} veces")
-
-    print("\n=== Métodos HTTP usados ===")
-    for metodo, cantidad in metodos.most_common():
-        print(f"  {metodo}: {cantidad} veces")
-
-
-def buscar_errores(registros):
-    """
-    Filtra y muestra solo las peticiones con código de error
-    (4xx = error del cliente, 5xx = error del servidor).
-    """
-    patron_error = re.compile(r"^[45]\d{2}$")  # empieza con 4 o 5, seguido de 2 dígitos
-
-    errores = [r for r in registros if patron_error.match(r["codigo"])]
-
-    print(f"\n=== Peticiones con error ({len(errores)} encontradas) ===")
-    for e in errores:
-        print(f"  Línea {e['linea']}: {e['ip']} -> {e['metodo']} {e['ruta']} "
-              f"[{e['codigo']}] el {e['fecha']}")
-
-    return errores
+    if total_coincidencias == 0:
+        print("  No se encontraron coincidencias.")
+    else:
+        print(f"\nTotal de coincidencias encontradas: {total_coincidencias}")
 
 
-def exportar_ips_unicas(registros, ruta_salida):
-    """
-    Guarda en un archivo de texto la lista de IPs únicas encontradas,
-    ordenadas alfabéticamente. Útil, por ejemplo, para pasarlas a una
-    lista de bloqueo o para análisis posterior.
-    """
-    ips_unicas = sorted(set(r["ip"] for r in registros))
+def elegir_opcion():
+    """Pide al usuario una opción válida del menú (o '0' para salir)."""
+    opcion = input("\nElige una opción: ").strip()
 
-    with open(ruta_salida, "w", encoding="utf-8") as f:
-        for ip in ips_unicas:
-            f.write(ip + "\n")
+    if opcion == "0":
+        return opcion
 
-    print(f"\nSe exportaron {len(ips_unicas)} IPs únicas a: {ruta_salida}")
+    if opcion not in PATRONES:
+        print("Opción no válida, intenta de nuevo.")
+        return None
+
+    return opcion
 
 
 # ---------------------------------------------------------------------------
 # PROGRAMA PRINCIPAL
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    ARCHIVO_LOG = "trafico.log"
-    ARCHIVO_SALIDA_IPS = "ips_unicas.txt"
+    lineas_log = cargar_lineas()
 
-    registros = leer_log(ARCHIVO_LOG)
+    while True:
+        mostrar_menu()
+        opcion = elegir_opcion()
 
-    if registros:
-        generar_estadisticas(registros)
-        buscar_errores(registros)
-        exportar_ips_unicas(registros, ARCHIVO_SALIDA_IPS)
-    else:
-        print("No se encontraron registros válidos en el archivo.")
+        if opcion == "0":
+            print("\nSaliendo del programa...")
+            break
+
+        if opcion is None:
+            continue
+
+        nombre_patron, patron_regex = PATRONES[opcion]
+        buscar_en_log(lineas_log, patron_regex, nombre_patron)
